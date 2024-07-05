@@ -4,16 +4,24 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import com.seosh817.coroutines_ble.logger.Logger
-import com.seosh817.coroutines_ble.scanner.CrBLEScanner
+import com.seosh817.coroutines_ble.scanner.CrBleScanner
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.scan
+import kotlinx.coroutines.launch
+
 
 @SuppressLint("MissingPermission")
-class CoroutinesBLE(private val context: Context) {
+class CoroutinesBle(private val context: Context) {
 
     private var bluetoothManager: BluetoothManager? = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
 
@@ -21,15 +29,19 @@ class CoroutinesBLE(private val context: Context) {
         bluetoothManager?.adapter
     }
 
-    private var bleScanner: CrBLEScanner? = null
+    private var bleScanner: CrBleScanner? = null
+
+    private val scanScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val adapterStateBroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: android.content.Intent?) {
             val action = intent?.action ?: return
             if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
-                handleScannerState(state)
-                // TODO: disconnect all devices
+                scanScope.launch {
+                    handleScannerState(state)
+                    // TODO: disconnect all devices
+                }
             }
         }
     }
@@ -45,53 +57,66 @@ class CoroutinesBLE(private val context: Context) {
 
     private val isBluetoothEnabled: Boolean
         get() {
-            if (bluetoothAdapter?.isEnabled == false) {
+            if (bluetoothAdapter?.isEnabled == true) {
                 return true
             }
-            Logger.e("Bluetooth disabled")
+            Logger.e("bluetoothAdapter: ${bluetoothAdapter}, isEnabled: ${bluetoothAdapter?.isEnabled}, Bluetooth disabled")
             return false
         }
 
     init {
-        bleScanner = CrBLEScanner.from(bluetoothAdapter)
+        bleScanner = CrBleScanner.from(bluetoothAdapter)
         context.registerReceiver(adapterStateBroadcastReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
     }
 
-    suspend fun startScan(scanFilters: List<ScanFilter> = emptyList(), scanSettings: ScanSettings = ScanSettings.Builder().build()) {
+    suspend fun startScan(
+        scanFilters: List<ScanFilter> = emptyList(),
+        scanSettings: ScanSettings = ScanSettings.Builder().build()
+    ): Flow<List<BleScanResult>> {
         try {
-            if (!isBleSupported || !isBluetoothEnabled) {
-                return
+            if (!isBleSupported) {
+                throw IllegalStateException("BLE not supported")
+            }
+            if (!isBluetoothEnabled) {
+                throw IllegalStateException("Bluetooth disabled")
             }
 
-            bleScanner?.startScan(scanFilters, scanSettings)
+            Logger.d("startScan: $scanFilters, $scanSettings")
+
+            return bleScanner!!
+                .startScan(scanFilters, scanSettings)
+                .scan(emptyList()) { acc, value ->
+                    if (!acc.map { it.device.address }.contains(value.device.address)) {
+                        acc + value
+                    } else {
+                        acc
+                    }
+                }
         } catch (e: Exception) {
             Logger.e("startScan error $e")
-        }
-    }
-
-    fun stopScan() {
-        try {
-            bleScanner?.stopScan()
-        } catch (e: Exception) {
-            Logger.e("stopScan error $e")
+            throw e
         }
     }
 
     private fun handleScannerState(state: Int) {
         when (state) {
             BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
-                if (bleScanner != null && bleScanner!!.isScanning) {
+                if (bleScanner != null) {
                     bleScanner?.stopScan()
                 }
             }
         }
     }
 
+    fun close() {
+        context.unregisterReceiver(adapterStateBroadcastReceiver)
+        bleScanner = null
+    }
 
     companion object {
 
-        fun from(context: Context): CoroutinesBLE {
-            return CoroutinesBLE(context)
+        fun from(context: Context): CoroutinesBle {
+            return CoroutinesBle(context)
         }
     }
 }
